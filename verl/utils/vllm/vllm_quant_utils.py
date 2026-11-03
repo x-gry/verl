@@ -240,6 +240,55 @@ def is_w4a8_weight(module) -> bool:
     return is_w4a8_linear or is_w4a8_moe
 
 
+HIFP4_QUANT_ALIASES = {
+    "W4A8_HIFP4_MXFP8": "W4A8_HIFP4_MXFP8",
+    "W4A8_HIF4_MXFP8": "W4A8_HIFP4_MXFP8",
+    "W4A8_HIF4": "W4A8_HIFP4_MXFP8",
+    "W4A4_HIFP4": "W4A4_HIFP4",
+    "W4A4_HIF4": "W4A4_HIFP4",
+}
+
+
+def _get_hifp4_scheme(module):
+    """Resolve HiFP4 schemes independently of their registered aliases."""
+    method = getattr(module, "quant_method", None)
+    scheme = getattr(method, "quant_method", method)
+    if getattr(scheme, "rl_quant_type", None) in HIFP4_QUANT_ALIASES:
+        return scheme
+    return None
+
+
+def _quantize_hifp4_weight(weight, scheme):
+    """Generate packed HiFP4 and FP32 checkpoint scales.
+
+    Requires a build accepting hifloat4_x2 in dynamic_mx_quant. This isolated
+    call is the integration point for the simulator's operator ABI.
+    """
+    import torch_npu
+
+    dst_type = getattr(torch_npu, "hifloat4_x2", None)
+    if dst_type is None:
+        raise RuntimeError("HiFP4 refit requires torch_npu.hifloat4_x2")
+    packed, scale = torch_npu.npu_dynamic_mx_quant(
+        weight,
+        axis=-1,
+        dst_type=dst_type,
+        block_size=scheme.group_size,
+    )
+    expected_shape = (*weight.shape[:-1], (weight.shape[-1] + scheme.group_size - 1) // scheme.group_size)
+    if tuple(scale.shape) == (*expected_shape, 1):
+        scale = scale.squeeze(-1)
+    if tuple(scale.shape) != expected_shape or scale.dtype != torch.float32:
+        raise ValueError(
+            f"HiFP4 scale must be FP32 with shape {expected_shape}; got {scale.dtype}, {tuple(scale.shape)}"
+        )
+    packed = packed.view(torch.uint8)
+    expected_weight_shape = (*weight.shape[:-1], (weight.shape[-1] + 1) // 2)
+    if tuple(packed.shape) != expected_weight_shape:
+        raise ValueError(f"HiFP4 packed weight must have shape {expected_weight_shape}; got {tuple(packed.shape)}")
+    return packed, scale
+
+
 def is_vllm_ascend_mx_quant(quant_config):
     try:
         from vllm_ascend.quantization import AscendModelSlimConfig
@@ -248,14 +297,18 @@ def is_vllm_ascend_mx_quant(quant_config):
         return False
     if not isinstance(quant_config, AscendModelSlimConfig):
         return False
-    mx_quant_types = ("W8A8_MXFP8", "W4A8_MXFP")
+    mx_quant_types = ("W8A8_MXFP8", "W4A8_MXFP", *HIFP4_QUANT_ALIASES)
     return any(quant_type in mx_quant_types for quant_type in quant_config.quant_description.values())
 
 
 def restore_mxfp8_weights_for_loading(model):
     for name, module in model.named_modules():
         if (
-            (hasattr(module, "_mxfp8_transformed") or hasattr(module, "_mxfp4_transformed"))
+            (
+                hasattr(module, "_mxfp8_transformed")
+                or hasattr(module, "_mxfp4_transformed")
+                or hasattr(module, "_hifp4_transformed")
+            )
             and hasattr(module, "quant_method")
             and hasattr(module.quant_method, "quant_method")
             and hasattr(module.quant_method.quant_method, "restore_weights_for_rl_loading")
@@ -264,7 +317,7 @@ def restore_mxfp8_weights_for_loading(model):
 
 
 def apply_mxfp8_transformation_after_loading(model):
-    """Re-apply MXFP8 transformations after weight loading.
+    """Re-apply Ascend MX/HiFP4 transformations after weight loading.
 
     This function iterates through all linear modules in the model and applies
     the MXFP8 transformations (transpose, reshape) that are required for NPU
@@ -280,10 +333,12 @@ def apply_mxfp8_transformation_after_loading(model):
 
     for name, module in model.named_modules():
         if (isinstance(module, LinearBase) or _is_expert_weight_module(module)) and (
-            hasattr(module, "_mxfp8_original_shapes") or hasattr(module, "_mxfp4_original_shapes")
+            hasattr(module, "_mxfp8_original_shapes")
+            or hasattr(module, "_mxfp4_original_shapes")
+            or hasattr(module, "_hifp4_original_shapes")
         ):
             if hasattr(module, "quant_method") and hasattr(module.quant_method, "process_weights_after_loading"):
-                logger.debug(f"Applying MXFP8 transformation for module: {name}")
+                logger.debug(f"Applying Ascend quantized transformation for module: {name}")
                 module.quant_method.process_weights_after_loading(module)
 
 
@@ -331,6 +386,7 @@ def _classify_quant_weight(name, model, is_ascend_mx):
     Returns
         ``"mx_fp8"``   Ascend W8A8_MXFP8 or standard FP8 weight on Ascend NPU,
         ``"mx_fp4"``   Ascend W4A8_MXFP weight (packed FP4 in uint8),
+        ``"hifp4"``    Ascend HiFP4 with FP32 group scales,
         ``"fp8"``      standard blockwise FP8 weight (non-Ascend),
         ``None``       parameter should pass through unquantized.
     """
@@ -338,13 +394,15 @@ def _classify_quant_weight(name, model, is_ascend_mx):
         return "mx_fp8" if is_ascend_mx else "fp8"
     if is_ascend_mx and name.endswith("weight"):
         module = get_module_from_param_name(model, name)
+        if _get_hifp4_scheme(module) is not None and is_w4a8_weight(module):
+            return "hifp4"
         if is_w4a8_weight(module):
             return "mx_fp4"
     return None
 
 
 def quant_weights(weights, model, quant_config, dtype=torch.bfloat16):
-    """Quantize weights to FP8 format using a memory-efficient generator.
+    """Quantize weights to FP8, MXFP4 or HiFP4 using a memory-efficient generator.
 
 
     Args:
@@ -375,7 +433,10 @@ def quant_weights(weights, model, quant_config, dtype=torch.bfloat16):
         # Cast the weight into quantized format and its scale factor
         if torch.distributed.get_rank() == 0:
             logger.debug(f"Quantizing to {quant_type} blockwise: {k}")
-        if quant_type in ("mx_fp8", "mx_fp4"):
+        if quant_type == "hifp4":
+            scheme = _get_hifp4_scheme(get_module_from_param_name(model, k))
+            param_lp, param_scale = _quantize_hifp4_weight(v.to(dtype), scheme)
+        elif quant_type in ("mx_fp8", "mx_fp4"):
             dst_type = torch_npu.float4_e2m1fn_x2 if quant_type == "mx_fp4" else torch_npu.float8_e4m3fn
             param_lp, param_scale = torch_npu.npu_dynamic_mx_quant(
                 v.to(dtype),
@@ -393,7 +454,8 @@ def quant_weights(weights, model, quant_config, dtype=torch.bfloat16):
                 v.to(dtype),
                 weight_block_size=quant_config.weight_block_size,
             )
-        param_scale = param_scale.squeeze(-1)
+        if quant_type != "hifp4":
+            param_scale = param_scale.squeeze(-1)
 
         # Yield the quantized weight
         yield (k, param_lp)

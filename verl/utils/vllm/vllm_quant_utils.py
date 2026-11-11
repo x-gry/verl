@@ -259,34 +259,37 @@ def _get_hifp4_scheme(module):
 
 
 def _quantize_hifp4_weight(weight, scheme):
-    """Generate packed HiFP4 and FP32 checkpoint scales.
+    """Generate packed HiFP4 and FP32 checkpoint scales with 64-element groups."""
+    if scheme.group_size != 64:
+        raise ValueError("dynamic_hi_f4_quant requires HiFP4 group_size=64")
+    if weight.ndim not in (2, 3):
+        raise ValueError("HiFP4 refit expects a matrix or an expert-first 3D tensor")
+    if weight.ndim == 3:
+        if weight.shape[0] == 0:
+            raise ValueError("HiFP4 refit requires at least one expert")
+        pairs = [_quantize_hifp4_weight(expert, scheme) for expert in weight.unbind(0)]
+        return torch.stack([pair[0] for pair in pairs]), torch.stack([pair[1] for pair in pairs])
 
-    Requires a build accepting hifloat4_x2 in dynamic_mx_quant. This isolated
-    call is the integration point for the simulator's operator ABI.
-    """
-    import torch_npu
+    # Import the registration module explicitly; importing cann_ops_nn alone
+    # does not guarantee that the custom operators have been registered.
+    import cann_ops_nn.ops  # noqa: F401
 
-    dst_type = getattr(torch_npu, "hifloat4_x2", None)
-    if dst_type is None:
-        raise RuntimeError("HiFP4 refit requires torch_npu.hifloat4_x2")
-    packed, scale = torch_npu.npu_dynamic_mx_quant(
-        weight,
-        axis=-1,
-        dst_type=dst_type,
-        block_size=scheme.group_size,
-    )
-    expected_shape = (*weight.shape[:-1], (weight.shape[-1] + scheme.group_size - 1) // scheme.group_size)
+    packed, scale = torch.ops.cann_ops_nn.dynamic_hi_f4_quant(weight, axis=-1)
+    expected_shape = (*weight.shape[:-1], (weight.shape[-1] + 63) // 64)
     if tuple(scale.shape) == (*expected_shape, 1):
         scale = scale.squeeze(-1)
     if tuple(scale.shape) != expected_shape or scale.dtype != torch.float32:
         raise ValueError(
             f"HiFP4 scale must be FP32 with shape {expected_shape}; got {scale.dtype}, {tuple(scale.shape)}"
         )
-    packed = packed.view(torch.uint8)
     expected_weight_shape = (*weight.shape[:-1], (weight.shape[-1] + 1) // 2)
-    if tuple(packed.shape) != expected_weight_shape:
-        raise ValueError(f"HiFP4 packed weight must have shape {expected_weight_shape}; got {tuple(packed.shape)}")
+    if packed.dtype != torch.uint8 or tuple(packed.shape) != expected_weight_shape:
+        raise ValueError(
+            f"HiFP4 packed weight must be uint8 with shape {expected_weight_shape}; "
+            f"got {packed.dtype}, {tuple(packed.shape)}"
+        )
     return packed, scale
+
 
 
 def is_vllm_ascend_mx_quant(quant_config):

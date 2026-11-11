@@ -15,17 +15,16 @@ This does not dequantize to BF16 or implement residual error compensation.
 
 ## Operator integration
 
-The isolated veRL `_quantize_hifp4_weight` call currently assumes
-`npu_dynamic_mx_quant(weight, axis=-1, dst_type=torch_npu.hifloat4_x2,
-block_size=scheme.group_size)`. This is an integration assumption, not a
-verified ABI for the simulation image. Verify the target torch_npu accepts
-these keywords and returns packed bytes and FP32 group scales. Update this
-single adapter if the supplied operator uses a different signature or scale
-representation. No fallback to E2M1 is performed.
+The veRL adapter imports `cann_ops_nn.ops` to register the operator, then calls
+`torch.ops.cann_ops_nn.dynamic_hi_f4_quant(weight, axis=-1)` for each 2D matrix.
+It returns packed uint8 weights and FP32 group scales. No dst_type or block_size
+argument is passed. The scheme must use 64-element groups. Expert-first 3D
+weights are quantized one expert at a time and stacked in checkpoint layout.
 
-Scale shapes before model loading are (..., ceil(K/group_size)); a single
-operator trailing scale dimension is removed without squeezing logical size-1
-dimensions. Loader code retains responsibility for TP/EP sharding.
+A trailing scale dimension is removed only when the output has shape
+(N, ceil(K/64), 1), preserving logical size-1 dimensions. Model loaders retain
+responsibility for TP/EP sharding. Inference layout handling remains in the
+backend process/restore methods. No fallback to E2M1 is performed.
 
 ## Validation
 
